@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cpa-stego-guard",
+      "name": "CPA Stego Guard",
+      "description": "Removes the steganographic markers that Claude Code 2.1.91-2.1.196 writes into the date line of requests sent to a non-official base URL.",
+      "author": "sketchain",
+      "repository": "https://github.com/sketchain/cpa-stego-guard",
+      "license": "MIT"
+    }
+  ]
+}
