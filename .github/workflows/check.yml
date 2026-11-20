@@ -83,7 +83,9 @@ jobs:
         run: go vet ./...
 
       - name: Fuzz the scanner briefly
-        run: go test -run '^$' -fuzz FuzzScan -fuzztime 20s ./internal/stego
+        run: |
+          go test -run '^$' -fuzz FuzzScan -fuzztime 20s ./internal/stego
+          go test -run '^$' -fuzz FuzzAlignCCVersion -fuzztime 20s ./internal/stego
 
       - name: Build the shared library
         run: |

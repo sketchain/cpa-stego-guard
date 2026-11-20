@@ -97,6 +97,8 @@ type Report struct {
 	// outside the date line apostrophes. They are reported, never edited.
 	StrayLab  int
 	StrayBoth int
+	// Billing is filled by ScanWith with Options.Billing.
+	Billing Billing
 }
 
 // Counts summarizes a report by marker type.
@@ -151,14 +153,24 @@ func LooksLikeMessages(body []byte) bool {
 	return ok
 }
 
+// messagesDoc holds the parts of a Messages request the scanners read. Every
+// result references body.
+type messagesDoc struct {
+	// firstUser is the first message whose role is user (Type is gjson.Null
+	// when there is none).
+	firstUser gjson.Result
+	// system and metadata are the first top-level members of those names.
+	system   gjson.Result
+	metadata gjson.Result
+}
+
 // parseMessages validates the Messages shape in one pass over the top-level
-// object and one pass over the messages array, and returns the first message
-// whose role is user (Type is gjson.Null when there is none).
-func parseMessages(body []byte) (gjson.Result, bool) {
-	var firstUser gjson.Result
+// object and one pass over the messages array.
+func parseMessages(body []byte) (messagesDoc, bool) {
+	var doc messagesDoc
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
-		return firstUser, false
+		return doc, false
 	}
 	// No separate validation pass: CLIProxyAPI has already parsed the body,
 	// and every edit is confined to a string literal whose bytes rawSpan and
@@ -170,6 +182,14 @@ func parseMessages(body []byte) (gjson.Result, bool) {
 		switch key.String() {
 		case "messages":
 			messages = value
+		case "system":
+			if !doc.system.Exists() {
+				doc.system = value
+			}
+		case "metadata":
+			if !doc.metadata.Exists() {
+				doc.metadata = value
+			}
 		case "contents", "input":
 			otherProtocol = true
 			return false
@@ -177,7 +197,7 @@ func parseMessages(body []byte) (gjson.Result, bool) {
 		return true
 	})
 	if otherProtocol || !messages.IsArray() || !strings.HasSuffix(messages.Raw, "]") {
-		return firstUser, false
+		return messagesDoc{}, false
 	}
 	openAIRole := false
 	messages.ForEach(func(_, message gjson.Result) bool {
@@ -187,33 +207,49 @@ func parseMessages(body []byte) (gjson.Result, bool) {
 			openAIRole = true
 			return false
 		case "user":
-			if firstUser.Type == gjson.Null {
-				firstUser = message
+			if doc.firstUser.Type == gjson.Null {
+				doc.firstUser = message
 			}
 		}
 		return true
 	})
 	if openAIRole {
-		return gjson.Result{}, false
+		return messagesDoc{}, false
 	}
-	return firstUser, true
+	return doc, true
 }
 
-// Scan inspects an Anthropic Messages request body. It returns a report with
-// Messages false, and nothing else, when the body does not have that shape.
+// Options selects optional work for ScanWith.
+type Options struct {
+	// Billing also reads the Claude Code billing header, the first user text
+	// that seeds its fingerprint, and metadata.user_id (Report.Billing).
+	Billing bool
+}
+
+// Scan inspects an Anthropic Messages request body for date line markers. It
+// returns a report with Messages false, and nothing else, when the body does
+// not have that shape.
 func Scan(body []byte) Report {
+	return ScanWith(body, Options{})
+}
+
+// ScanWith is Scan with optional extra work, sharing one parse of the body.
+func ScanWith(body []byte, opts Options) Report {
 	var report Report
-	firstUser, ok := parseMessages(body)
+	doc, ok := parseMessages(body)
 	if !ok {
 		return report
 	}
 	report.Messages = true
-	if firstUser.Type != gjson.Null && bytes.Contains(body, systemReminderProbe) {
-		for _, text := range firstUserTexts(body, firstUser) {
+	if doc.firstUser.Type != gjson.Null && bytes.Contains(body, systemReminderProbe) {
+		for _, text := range firstUserTexts(body, doc.firstUser) {
 			report.DateLines = append(report.DateLines, scanText(body, text)...)
 		}
 	}
 	report.StrayLab, report.StrayBoth = countStrayModifiers(body, report.DateLines)
+	if opts.Billing {
+		report.Billing = scanBilling(body, doc)
+	}
 	return report
 }
 
