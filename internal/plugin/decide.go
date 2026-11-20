@@ -3,6 +3,7 @@ package plugin
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/sketchain/cpa-stego-guard/internal/stego"
@@ -16,6 +17,10 @@ const (
 	ActionCleaned Action = "cleaned"
 	ActionBlocked Action = "blocked"
 	ActionLogged  Action = "logged"
+	// ActionAligned and ActionFallback report a cc_version outcome applied to
+	// a request without date line markers.
+	ActionAligned  Action = "aligned"
+	ActionFallback Action = "fallback"
 )
 
 // Decision is the outcome of applying a configuration to a scan report.
@@ -25,13 +30,18 @@ type Decision struct {
 	Edits  []bodyEdit
 	// Reasons lists the marker types that caused a block, in a fixed order.
 	Reasons []string
+	// CC is the cc_version alignment outcome. CCApplied reports that its
+	// edits are part of Edits; in log mode it is computed and only logged.
+	CC        stego.CCResult
+	CCApplied bool
 }
 
 // Decide applies cfg to report. It is a pure function: the same inputs always
-// produce the same decision, and the edits are ordered by offset.
+// produce the same decision, and the edits are ordered by offset. The report
+// must come from stego.ScanWith with Options.Billing when cfg.CCVersion is set.
 func Decide(cfg Config, report stego.Report) Decision {
 	counts := report.Counts()
-	decision := Decision{Action: ActionNone, Counts: counts}
+	decision := Decision{Action: ActionNone, Counts: counts, CC: stego.CCResult{Kind: stego.CCNone}}
 	if cfg.Mode == ModeOff || !report.Messages {
 		return decision
 	}
@@ -62,6 +72,17 @@ func Decide(cfg Config, report stego.Report) Decision {
 	if decision.Action == ActionNone && counts.Any() {
 		decision.Action = ActionLogged
 	}
+	// A blocked request is never forwarded, so its billing header is moot.
+	if cfg.CCVersion != "" && decision.Action != ActionBlocked {
+		decision.CC = stego.AlignCCVersion(report.Billing, cfg.CCVersion)
+		if decision.CC.Kind != stego.CCNone && (cfg.Mode == ModeClean || cfg.Mode == ModeBlock) {
+			for _, edit := range decision.CC.Edits {
+				decision.Edits = append(decision.Edits, bodyEdit{Start: edit.Start, End: edit.End, Replacement: edit.Replacement})
+			}
+			decision.CCApplied = true
+		}
+	}
+	sort.Slice(decision.Edits, func(i, j int) bool { return decision.Edits[i].Start < decision.Edits[j].Start })
 	return decision
 }
 

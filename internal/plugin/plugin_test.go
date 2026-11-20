@@ -228,7 +228,7 @@ func TestRegisterCapabilitiesPerMode(t *testing.T) {
 	if !reg.Capabilities.RequestInterceptor || !reg.Capabilities.RequestInterceptorOmitBodyAfter || reg.Capabilities.RequestInterceptorPatchBodyBefore {
 		t.Fatalf("block capabilities %+v", reg.Capabilities)
 	}
-	if len(reg.Metadata.ConfigFields) != 3 {
+	if len(reg.Metadata.ConfigFields) != 4 {
 		t.Fatalf("config fields %+v", reg.Metadata.ConfigFields)
 	}
 }

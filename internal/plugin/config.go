@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/sketchain/cpa-stego-guard/internal/stego"
 	"gopkg.in/yaml.v3"
 )
 
@@ -29,6 +30,10 @@ type Config struct {
 	CleanQuoteMarkers bool
 	// CleanRegionMarker acts on the slash date (China time zone marker).
 	CleanRegionMarker bool
+	// CCVersion is the Claude Code version every billing header cc_version is
+	// aligned to. Empty disables alignment. It must equal the User-Agent
+	// version CLIProxyAPI sends upstream, which the plugin API does not expose.
+	CCVersion string
 }
 
 // DefaultConfig is used for omitted keys.
@@ -40,6 +45,7 @@ type rawConfig struct {
 	Mode              *string `yaml:"mode"`
 	CleanQuoteMarkers *bool   `yaml:"clean_quote_markers"`
 	CleanRegionMarker *bool   `yaml:"clean_region_marker"`
+	CCVersion         *string `yaml:"cc_version"`
 }
 
 // ParseConfig reads the plugin YAML. Omitted keys take their defaults. An
@@ -68,6 +74,16 @@ func ParseConfig(raw []byte) (Config, []string, error) {
 	if parsed.CleanRegionMarker != nil {
 		cfg.CleanRegionMarker = *parsed.CleanRegionMarker
 	}
+	if parsed.CCVersion != nil {
+		version := strings.TrimSpace(*parsed.CCVersion)
+		switch {
+		case version == "":
+		case stego.ValidVersion(version):
+			cfg.CCVersion = version
+		default:
+			warnings = append(warnings, fmt.Sprintf("cc_version %q is not a version like 2.1.321, cc_version alignment is disabled", *parsed.CCVersion))
+		}
+	}
 	return cfg, warnings, nil
 }
 
@@ -91,6 +107,13 @@ func configFields() []configField {
 			Type:        "boolean",
 			Default:     true,
 			Description: "Act on the YYYY/MM/DD date (China time zone marker). When false it is only logged.",
+		},
+		{
+			Name:    "cc_version",
+			Type:    "string",
+			Default: "",
+			Description: "Align the billing header cc_version of every Claude Code request to this version, with a recomputed fingerprint. " +
+				"Must equal the User-Agent version CLIProxyAPI sends upstream (its built-in baseline unless claude-header-defaults.user-agent is set). Empty disables alignment.",
 		},
 	}
 }

@@ -14,6 +14,7 @@ inside a private mount and network namespace (unshare -mn). Inside it:
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -40,7 +41,28 @@ REMINDER = ("<system-reminder>\nAs you answer the user's questions, you can use 
             "      IMPORTANT: this context may or may not be relevant to your tasks. "
             "You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>\n")
 
+TARGET_VERSION = "2.1.321"  # CPA v8's built-in baseline (claude-cli/2.1.321)
+USER_TEXT = "Fix the failing test."
+
 results = []
+
+
+def fingerprint(text, version):
+    """Claude Code's cc_version fingerprint, computed independently of the plugin."""
+    units = text.encode("utf-16-le")
+    sampled = b"".join(units[i * 2:i * 2 + 2] if i * 2 + 2 <= len(units) else b"0\x00" for i in (4, 7, 20))
+    picked = sampled.decode("utf-16-le", errors="replace")
+    return hashlib.sha256(("59cf53e54c78" + picked + version).encode("utf-8")).hexdigest()[:3]
+
+
+def cc_version_of(billing_text):
+    match = re.search(r"cc_version=([0-9.]+)\.([0-9a-f]{3});", billing_text)
+    return (match.group(1), match.group(2)) if match else (None, None)
+
+
+def signed_cch(billing_text):
+    match = re.search(r" cch=([0-9a-f]{5});", billing_text)
+    return match is not None and match.group(1) != "00000"
 
 
 def check(name, condition, detail=""):
@@ -60,7 +82,7 @@ def date_line(quote="'", sep="-"):
     return f"Today{quote}s date is 2026{sep}10{sep}09."
 
 
-def cc_body(date, user_text="Fix the failing test.", stream=True, cc_version="2.1.321.a1b"):
+def cc_body(date, user_text=USER_TEXT, stream=True, cc_version="2.1.321.a1b"):
     body = {
         "model": "claude-sonnet-4-6",
         "messages": [{"role": "user", "content": [
@@ -142,6 +164,9 @@ class CPA:
         self.proc = subprocess.Popen([binary, "-config", self.config_path], cwd=workdir, env=env,
                                      stdout=self.log, stderr=subprocess.STDOUT)
         self.wait_for("cpa-stego-guard configured", 60)
+        # Requests sent before the credential's models are registered fail
+        # with "unknown provider".
+        self.wait_for("full client load complete", 60)
         self.wait_http()
 
     def write_config(self, plugin_config):
@@ -198,9 +223,9 @@ def post(path, body, headers):
         return err.code, err.read()
 
 
-def send(upstream, path, body, version="2.1.321"):
+def send(upstream, path, body, version="2.1.321", headers=None):
     before = len(upstream.entries())
-    status, raw = post(path, body, cc_headers(version))
+    status, raw = post(path, body, headers or cc_headers(version))
     entries = upstream.entries()
     sent = [base64.b64decode(e["body_b64"]) for e in entries[before:]]
     heads = [dict(e["headers"]) for e in entries[before:]]
@@ -350,33 +375,118 @@ def run(args):
         check("clean/noquote: only the slash is cleaned", status == 200 and date_line(Q_DOMAIN, "-") in first_user_text(sent[0]))
         cpa.stop()
 
-        # ---- informational: stabilize-device-profile (phase 1, item 4) ----
-        print("\n==> info: claude-header-defaults.stabilize-device-profile=true, client 2.1.330", flush=True)
-        cpa = CPA(args.cpa, workdir, "stabilize", {"mode": "clean"},
-                  ["claude-header-defaults:", "  stabilize-device-profile: true"])
-        newer = cc_body(date_line(), cc_version="2.1.330.e5f")
-        headers = cc_headers("2.1.330")
-        headers["X-Stainless-Runtime-Version"] = "v26.14.0"
-        headers["X-Stainless-OS"] = "Windows"
-        headers["X-Stainless-Arch"] = "x64"
-        before = len(upstream.entries())
-        status, _ = post("/v1/messages", newer, headers)
-        entry = upstream.entries()[before]
-        up_headers = dict(entry["headers"])
-        observed = {k: up_headers.get(k, "") for k in ["User-Agent", "X-Stainless-Package-Version", "X-Stainless-Runtime-Version",
-                                                       "X-Stainless-OS", "X-Stainless-Arch"]}
-        observed["billing"] = billing(base64.b64decode(entry["body_b64"]))
-        observed["status"] = status
-        summary["stabilize_device_profile_2_1_330"] = observed
+        # ---- cc_version alignment with stabilize-device-profile ----
+        newer_headers = cc_headers("2.1.330")
+        newer_headers["X-Stainless-Runtime-Version"] = "v26.14.0"
+        newer_headers["X-Stainless-OS"] = "Windows"
+        newer_headers["X-Stainless-Arch"] = "x64"
+        fp_client = fingerprint(USER_TEXT, "2.1.330")
+        fp_target = fingerprint(USER_TEXT, TARGET_VERSION)
+        newer = cc_body(date_line(), cc_version=f"2.1.330.{fp_client}")
+        bad_fp = "000" if fp_client != "000" else "001"
+        tampered = cc_body(date_line(), cc_version=f"2.1.330.{bad_fp}")
+        stabilize = ["claude-header-defaults:", "  stabilize-device-profile: true"]
+
+        print("\n==> stabilize-device-profile=true, no cc_version (the problem)", flush=True)
+        cpa = CPA(args.cpa, workdir, "stabilize-off", {"mode": "clean"}, stabilize)
+        check("no cc_version: registration warns that alignment is disabled", "cc_version is empty" in cpa.log_text())
+        status, _, sent, heads = send(upstream, "/v1/messages", newer, headers=newer_headers)
+        observed = describe(sent[0], heads[0])
+        summary["stabilize_without_cc_version"] = observed
+        check("no cc_version: CPA sends UA 2.1.321 but the body keeps cc_version 2.1.330 (mismatch)",
+              status == 200 and observed["user_agent"].startswith(f"claude-cli/{TARGET_VERSION} ")
+              and cc_version_of(observed["billing"]) == ("2.1.330", fp_client), json.dumps(observed))
+        cpa.stop()
+
+        print("\n==> stabilize-device-profile=true, cc_version=2.1.321", flush=True)
+        cpa = CPA(args.cpa, workdir, "stabilize", {"mode": "clean", "cc_version": TARGET_VERSION}, stabilize)
+        check("cc_version: registration logs the target", f"cc_version={TARGET_VERSION}" in cpa.log_text())
+        # Reference: a client already at the target version; the plugin leaves it alone.
+        reference = cc_body(date_line(), cc_version=f"{TARGET_VERSION}.{fp_target}")
+        status, _, sent, heads = send(upstream, "/v1/messages", reference)
+        check("cc_version: 2.1.321 client forwarded", status == 200 and len(sent) == 1, f"status={status}")
+        reference_up = sent[0]
+        summary["stabilize_reference_2_1_321"] = describe(reference_up, heads[0])
+        check("cc_version: 2.1.321 client upstream billing is cc_version=2.1.321.<fp> with a signed cch",
+              cc_version_of(billing(reference_up)) == (TARGET_VERSION, fp_target) and signed_cch(billing(reference_up)),
+              billing(reference_up))
+
+        offset = len(cpa.log_text())
+        status, _, sent, heads = send(upstream, "/v1/messages", newer, headers=newer_headers)
+        up = sent[0] if sent else b"{}"
+        observed = describe(up, heads[0] if heads else {})
+        observed.update({k: (heads[0] if heads else {}).get(k, "") for k in ["X-Stainless-Package-Version", "X-Stainless-Runtime-Version"]})
+        summary["stabilize_aligned_2_1_330"] = observed
         print("  observed: " + json.dumps(observed), flush=True)
+        check("cc_version: 2.1.330 client -> upstream UA claude-cli/2.1.321",
+              status == 200 and observed["user_agent"].startswith(f"claude-cli/{TARGET_VERSION} "), observed["user_agent"])
+        check("cc_version: 2.1.330 client -> upstream cc_version=2.1.321.<independently computed fingerprint>",
+              cc_version_of(observed["billing"]) == (TARGET_VERSION, fp_target), observed["billing"])
+        check("cc_version: aligned request is still confirmed Claude Code (system prompt passed through, 2 blocks)",
+              observed["original_prompt_kept"] and observed["system_blocks"] == 2, json.dumps(observed))
+        check("cc_version: cch valid -- upstream body byte-identical to CPA's signed 2.1.321 reference",
+              up == reference_up and signed_cch(observed["billing"]), f"{observed['billing']} vs {billing(reference_up)}")
+        check("cc_version: alignment logged at debug with versions only",
+              "cpa-stego-guard aligned cc_version" in cpa.log_text()[offset:] and "cc_version_from=2.1.330" in cpa.log_text()[offset:])
+
+        # Idempotent end to end: the aligned body sent again is not changed further.
+        status, _, sent, _ = send(upstream, "/v1/messages", newer, headers=newer_headers)
+        check("cc_version: repeated request gives the same upstream bytes", status == 200 and sent and sent[0] == reference_up)
+
+        # Date line cleaning and alignment on the same request.
+        marked_newer = cc_body(date_line(Q_BOTH, "/"), cc_version=f"2.1.330.{fp_client}")
+        status, _, sent, _ = send(upstream, "/v1/messages", marked_newer, headers=newer_headers)
+        check("cc_version + date cleaning: upstream body identical to the reference (incl. cch)",
+              status == 200 and sent and sent[0] == reference_up, billing(sent[0]) if sent else "")
+
+        # Tampered fingerprint: the plugin removes the billing header and metadata.user_id; CPA cloaks.
+        offset = len(cpa.log_text())
+        status, _, sent, heads = send(upstream, "/v1/messages", tampered, headers=newer_headers)
+        up = sent[0] if sent else b"{}"
+        observed = describe(up, heads[0] if heads else {})
+        doc = json.loads(up)
+        user_id = (doc.get("metadata") or {}).get("user_id", "")
+        observed["metadata_user_id_from_client"] = DEVICE_ID in user_id
+        observed["upstream_has_metadata_user_id"] = bool(user_id)
+        summary["stabilize_tampered_fallback"] = observed
+        summary["stabilize_tampered_fallback_first_user"] = first_user_text(up)
+        print("  observed: " + json.dumps(observed), flush=True)
+        version, fp_up = cc_version_of(observed["billing"])
+        check("fallback: tampered request forwarded", status == 200 and len(sent) == 1, f"status={status}")
+        check("fallback: upstream billing is CPA's own, cc_version 2.1.321 with a signed cch",
+              version == TARGET_VERSION and fp_up is not None and signed_cch(observed["billing"])
+              and f"2.1.330.{bad_fp}" not in up.decode("utf-8"), observed["billing"])
+        check("fallback: CPA cloaked the request (caller system prompt not kept in system)",
+              not observed["original_prompt_kept"], json.dumps(observed))
+        check("fallback: client metadata.user_id not forwarded (CPA supplies its own)",
+              not observed["metadata_user_id_from_client"], user_id)
+        check("fallback: upstream UA claude-cli/2.1.321", observed["user_agent"].startswith(f"claude-cli/{TARGET_VERSION} "))
+        check("fallback: logged with reason", "cc_version_reason=fingerprint_mismatch" in cpa.log_text()[offset:])
+        check("fallback: upstream view equals CPA's cloak of an unconfirmed old client (mode=off)",
+              {k: observed[k] for k in ("system_blocks", "original_prompt_kept", "first_user_blocks")}
+              == {k: summary["old_client_off_upstream"][k] for k in ("system_blocks", "original_prompt_kept", "first_user_blocks")},
+              json.dumps([observed, summary["old_client_off_upstream"]]))
+        cpa.stop()
+
+        print("\n==> mode=block, cc_version=2.1.321", flush=True)
+        cpa = CPA(args.cpa, workdir, "block-cc", {"mode": "block", "cc_version": TARGET_VERSION}, stabilize)
+        status, _, sent, _ = send(upstream, "/v1/messages", marked_newer, headers=newer_headers)
+        check("block/cc_version: marked request still blocked", status == 400 and not sent, f"status={status}")
+        status, _, sent, _ = send(upstream, "/v1/messages", newer, headers=newer_headers)
+        check("block/cc_version: unmarked request aligned (identical to the reference)",
+              status == 200 and sent and sent[0] == reference_up, billing(sent[0]) if sent else "")
         cpa.stop()
 
         # ---- mode: log ----
         print("\n==> mode=log", flush=True)
-        cpa = CPA(args.cpa, workdir, "log", {"mode": "log"})
+        cpa = CPA(args.cpa, workdir, "log", {"mode": "log", "cc_version": TARGET_VERSION}, stabilize)
         status, _, sent, _ = send(upstream, "/v1/messages", marked)
         check("log: marked request forwarded unchanged", status == 200 and date_line(Q_DOMAIN, "/") in first_user_text(sent[0]))
         check("log: host log records action=logged", "action=logged" in cpa.log_text())
+        status, _, sent, _ = send(upstream, "/v1/messages", newer, headers=newer_headers)
+        check("log/cc_version: cc_version left at 2.1.330, would-align logged",
+              status == 200 and cc_version_of(billing(sent[0])) == ("2.1.330", fp_client)
+              and "would align cc_version" in cpa.log_text())
         cpa.stop()
     finally:
         upstream.stop()
