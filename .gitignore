@@ -1,0 +1,12 @@
+dist/
+*.so
+*.dylib
+*.dll
+*.h
+*.test
+*.out
+.DS_Store
+.claude
+.env
+.env.*
+__pycache__/
