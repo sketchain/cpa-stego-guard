@@ -136,6 +136,20 @@ func TestPatchBodyCCVersionUnchanged(t *testing.T) {
 	if resp := result[patchResponse](t, mustHandle(t, app, methodPatchBodyBefore, body)); len(resp.Edits) != 0 || len(host.logs) != 0 {
 		t.Fatalf("same version: %+v %+v", resp, host.logs)
 	}
+	// Already at the target version but with a tampered fingerprint: fallback.
+	host.logs = nil
+	bad := "000"
+	if bad == stego.Fingerprint(userPrompt, targetVersion) {
+		bad = "001"
+	}
+	body = ccRequest(t, date, targetVersion, bad, false)
+	out := splice(t, body, result[patchResponse](t, mustHandle(t, app, methodPatchBodyBefore, body)).Edits)
+	if v := view(t, out); len(v.System) != 1 || v.Metadata["user_id"] != nil {
+		t.Fatalf("same version, tampered: billing header or user_id kept: %s", out)
+	}
+	if len(host.logs) != 1 || !strings.Contains(host.logs[0].message, "cc_version=fallback cc_version_applied=true cc_version_from=2.1.321 cc_version_to=2.1.321 cc_version_reason=fingerprint_mismatch") {
+		t.Fatalf("same version, tampered: logs = %+v", host.logs)
+	}
 	// cc_version not configured: an older client and a tampered one both pass.
 	app, host, _ = newTestApp(t, "mode: clean")
 	host.logs = nil

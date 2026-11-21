@@ -469,7 +469,8 @@ type CCKind string
 
 const (
 	// CCNone leaves the request alone: alignment is off, there is no billing
-	// header, or every cc_version already equals the target.
+	// header, or every cc_version already equals the target and carries a
+	// valid fingerprint.
 	CCNone CCKind = "none"
 	// CCAlign rewrites cc_version to the target version and its fingerprint.
 	CCAlign CCKind = "align"
@@ -489,8 +490,9 @@ const (
 // CCResult is the outcome of aligning cc_version.
 type CCResult struct {
 	Kind CCKind
-	// From is the client's cc_version (the first one that differs from the
-	// target), empty when the billing header could not be read.
+	// From is the client's cc_version: the first one that differs from the
+	// target, else the target itself when a block at the target version fails
+	// verification; empty when the billing header could not be read.
 	From string
 	// Reason explains a fallback.
 	Reason string
@@ -505,13 +507,14 @@ type Edit struct {
 }
 
 // AlignCCVersion decides how to bring the billing header of a request to the
-// target version. It is a pure function of its inputs. Each cc_version that
-// already equals target is left alone. Every other one must carry the
-// fingerprint Claude Code computes for its own version; then it is rewritten
-// to target with the fingerprint recomputed for target, and cch is left for
-// CLIProxyAPI to re-sign. If any billing block cannot be read or verified, the
-// result is a fallback that removes all billing blocks and metadata.user_id.
-// Applying the result and aligning again yields CCNone.
+// target version. It is a pure function of its inputs. Every cc_version must
+// carry the fingerprint Claude Code computes for its own version, including
+// one that already equals target. A verified cc_version equal to target is
+// left alone; any other verified one is rewritten to target with the
+// fingerprint recomputed for target, and cch is left for CLIProxyAPI to
+// re-sign. If any billing block cannot be read or verified, the result is a
+// fallback that removes all billing blocks and metadata.user_id. Applying the
+// result and aligning again yields CCNone.
 func AlignCCVersion(billing Billing, target string) CCResult {
 	result := CCResult{Kind: CCNone}
 	if target == "" || len(billing.Blocks) == 0 {
@@ -519,19 +522,28 @@ func AlignCCVersion(billing Billing, target string) CCResult {
 	}
 	var edits []Edit
 	for _, block := range billing.Blocks {
-		if block.Parsed && block.Version == target {
-			continue
-		}
-		if result.From == "" {
+		atTarget := block.Parsed && block.Version == target
+		if !atTarget && result.From == "" {
 			result.From = block.Version
 		}
+		var reason string
 		switch {
 		case !block.Parsed:
-			return fallback(billing, result.From, ReasonUnrecognized)
+			reason = ReasonUnrecognized
 		case !billing.FingerprintKnown:
-			return fallback(billing, result.From, ReasonFingerprintUnknown)
+			reason = ReasonFingerprintUnknown
 		case fingerprintRunes(billing.FingerprintText, block.Version) != block.Fingerprint:
-			return fallback(billing, result.From, ReasonFingerprintInvalid)
+			reason = ReasonFingerprintInvalid
+		}
+		if reason != "" {
+			from := result.From
+			if from == "" {
+				from = block.Version
+			}
+			return fallback(billing, from, reason)
+		}
+		if atTarget {
+			continue
 		}
 		edits = append(edits, Edit{
 			Span:        block.ValueSpan,
