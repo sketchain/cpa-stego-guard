@@ -82,7 +82,10 @@ def date_line(quote="'", sep="-"):
     return f"Today{quote}s date is 2026{sep}10{sep}09."
 
 
-def cc_body(date, user_text=USER_TEXT, stream=True, cc_version="2.1.321.a1b"):
+def cc_body(date, user_text=USER_TEXT, stream=True, cc_version=None):
+    if cc_version is None:
+        # A genuine 2.1.321 client: the fingerprint matches the user text.
+        cc_version = f"{TARGET_VERSION}.{fingerprint(user_text, TARGET_VERSION)}"
     body = {
         "model": "claude-sonnet-4-6",
         "messages": [{"role": "user", "content": [
@@ -466,6 +469,37 @@ def run(args):
               {k: observed[k] for k in ("system_blocks", "original_prompt_kept", "first_user_blocks")}
               == {k: summary["old_client_off_upstream"][k] for k in ("system_blocks", "original_prompt_kept", "first_user_blocks")},
               json.dumps([observed, summary["old_client_off_upstream"]]))
+        fallback_view = observed
+
+        # Client already at the target version but with a tampered fingerprint: verified like any
+        # other version, so the plugin falls back and CPA's cloak writes the billing header.
+        bad_target_fp = "000" if fp_target != "000" else "001"
+        tampered_target = cc_body(date_line(), cc_version=f"{TARGET_VERSION}.{bad_target_fp}")
+        offset = len(cpa.log_text())
+        status, _, sent, heads = send(upstream, "/v1/messages", tampered_target)
+        up = sent[0] if sent else b"{}"
+        observed = describe(up, heads[0] if heads else {})
+        doc = json.loads(up)
+        user_id = (doc.get("metadata") or {}).get("user_id", "")
+        observed["metadata_user_id_from_client"] = DEVICE_ID in user_id
+        summary["stabilize_tampered_target_fallback"] = observed
+        print("  observed: " + json.dumps(observed), flush=True)
+        version, fp_up = cc_version_of(observed["billing"])
+        check("fallback/2.1.321 tampered: request forwarded", status == 200 and len(sent) == 1, f"status={status}")
+        check("fallback/2.1.321 tampered: upstream billing is CPA's cloak billing (cc_version 2.1.321, signed cch), "
+              "not the client's",
+              version == TARGET_VERSION and fp_up is not None and signed_cch(observed["billing"])
+              and f"{TARGET_VERSION}.{bad_target_fp};" not in up.decode("utf-8"), observed["billing"])
+        check("fallback/2.1.321 tampered: same billing cc_version as CPA's cloak of the tampered 2.1.330 request",
+              cc_version_of(observed["billing"]) == cc_version_of(fallback_view["billing"]),
+              f"{observed['billing']} vs {fallback_view['billing']}")
+        check("fallback/2.1.321 tampered: CPA cloaked the request (caller system prompt not kept in system)",
+              not observed["original_prompt_kept"], json.dumps(observed))
+        check("fallback/2.1.321 tampered: client metadata.user_id not forwarded",
+              not observed["metadata_user_id_from_client"], user_id)
+        check("fallback/2.1.321 tampered: logged with reason",
+              "cc_version_reason=fingerprint_mismatch" in cpa.log_text()[offset:]
+              and f"cc_version_from={TARGET_VERSION}" in cpa.log_text()[offset:])
         cpa.stop()
 
         print("\n==> mode=block, cc_version=2.1.321", flush=True)

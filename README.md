@@ -48,10 +48,10 @@ CPA v8 打开 `claude-header-defaults.stabilize-device-profile` 后，客户端�
 
 配置 `cc_version` 后，插件对每个 Messages 形状的请求：
 
-1. 找到 `system` 数组里以 `x-anthropic-billing-header:` 开头的文本块，读出 `cc_version=<版本>.<3 位十六进制指纹>;`。没有 billing 头（不是 Claude Code）就不动；版本已等于目标也不动。
-2. 用**原版本号**按 Claude Code 的算法重算指纹：`SHA256("59cf53e54c78" + 指纹文本的 UTF-16 第 4、7、20 个单元（越界补 '0'，孤立代理项按 U+FFFD 编码）+ 版本号)` 的十六进制前 3 位。指纹文本按 CPA 的取法：首条用户消息的 content 是字符串时取整个字符串，是数组时取第一个不是 `<system-reminder>…</system-reminder>` 块（也不是 currentDate 提醒）的 text 块。
-3. **校验通过**：把 `<版本>.<指纹>` 改成 `<目标版本>.<按目标版本重算的指纹>`，其余字节（包括 `cch`）不动。CPA 在插件之后对最终请求体重签 `cch`。
-4. **校验不通过**（指纹对不上、billing 头格式认不出、或指纹文本无法按 CPA 的方式确定）：不原样透传，而是删掉 billing 文本块和 `metadata.user_id`。CPA 识别 Claude Code 时 `/v1/messages` 必须有合法的 `metadata.user_id`，删掉后请求被当作普通 API 客户端：走 CPA 的 cloak 路径，由 CPA 自己生成 billing 头（版本取 CPA 的 `DefaultClaudeVersion`，即基线版本），并用 CPA 自己的 `metadata.user_id`。对未识别的请求 CPA 本来就忽略客户端的 `metadata.user_id`，所以删除它不损失信息。
+1. 找到 `system` 数组里以 `x-anthropic-billing-header:` 开头的文本块，读出 `cc_version=<版本>.<3 位十六进制指纹>;`。没有 billing 头（不是 Claude Code）就不动。
+2. 不论版本是否已等于目标，都用**原版本号**按 Claude Code 的算法重算指纹：`SHA256("59cf53e54c78" + 指纹文本的 UTF-16 第 4、7、20 个单元（越界补 '0'，孤立代理项按 U+FFFD 编码）+ 版本号)` 的十六进制前 3 位。指纹文本按 CPA 的取法：首条用户消息的 content 是字符串时取整个字符串，是数组时取第一个不是 `<system-reminder>…</system-reminder>` 块（也不是 currentDate 提醒）的 text 块。
+3. **校验通过**：版本已等于目标时原样放行；否则把 `<版本>.<指纹>` 改成 `<目标版本>.<按目标版本重算的指纹>`，其余字节（包括 `cch`）不动。CPA 在插件之后对最终请求体重签 `cch`。
+4. **校验不通过**（指纹对不上、billing 头格式认不出、或指纹文本无法按 CPA 的方式确定；版本已等于目标但指纹被改过也算）：不原样透传，而是删掉 billing 文本块和 `metadata.user_id`。CPA 识别 Claude Code 时 `/v1/messages` 必须有合法的 `metadata.user_id`，删掉后请求被当作普通 API 客户端：走 CPA 的 cloak 路径，由 CPA 自己生成 billing 头（版本取 CPA 的 `DefaultClaudeVersion`，即基线版本），并用 CPA 自己的 `metadata.user_id`。对未识别的请求 CPA 本来就忽略客户端的 `metadata.user_id`，所以删除它不损失信息。
 
 只改请求体（继续用 `request.patch_body_before`，`block` 模式用 `request.intercept_before`），不改请求头，不增加钩子；未配置 `cc_version` 时连 billing 头都不读。改写是字节区间补丁，长度可以变化，不重新序列化 JSON；再过一遍不会再改。
 
@@ -104,8 +104,9 @@ plugins:
 | 有启用类别的标记 | 清洗后转发 | 400，不转发 | 原样转发，记日志 | 原样转发 |
 | 只有关掉类别的标记 | 原样转发，记日志 | 原样转发，记日志 | 原样转发，记日志 | 原样转发 |
 | 日期行外有 U+02BC / U+02B9 | 原样转发，记日志 | 原样转发，记日志 | 原样转发，记日志 | 原样转发 |
+| `cc_version` 等于目标，指纹校验通过 | 原样转发 | 原样转发 | 原样转发 | 原样转发 |
 | `cc_version` 与目标不同，指纹校验通过 | 改写成目标版本 | 改写成目标版本 | 原样转发，记日志 | 原样转发 |
-| `cc_version` 指纹校验不通过 | 删 billing 头和 `metadata.user_id`，CPA cloak | 同左 | 原样转发，记日志 | 原样转发 |
+| `cc_version` 指纹校验不通过（含版本等于目标时） | 删 billing 头和 `metadata.user_id`，CPA cloak | 同左 | 原样转发，记日志 | 原样转发 |
 
 `block` 模式返回的响应体是 Anthropic 错误格式：
 

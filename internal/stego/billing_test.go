@@ -136,10 +136,32 @@ func TestAlignCCVersion(t *testing.T) {
 	if again, _ := align(t, out, "2.1.321"); again.Kind != CCNone || len(again.Edits) != 0 {
 		t.Fatalf("second pass: %+v", again)
 	}
-	// Same version as the target, even with a wrong fingerprint: untouched.
-	same := billingBody("x-anthropic-billing-header: cc_version=2.1.321.fff; cc_entrypoint=cli;", "Fix it.")
-	if r, _ := align(t, same, "2.1.321"); r.Kind != CCNone {
-		t.Fatalf("same version: %+v", r)
+	// Same version as the target with its own valid fingerprint: untouched.
+	valid := billingBody("x-anthropic-billing-header: cc_version=2.1.321."+Fingerprint("Fix it.", "2.1.321")+"; cc_entrypoint=cli;", "Fix it.")
+	if r, out := align(t, valid, "2.1.321"); r.Kind != CCNone || len(r.Edits) != 0 || out != valid {
+		t.Fatalf("same version, valid fingerprint: %+v", r)
+	}
+	// Same version as the target with a wrong fingerprint: verified like any
+	// other version, so it falls back.
+	wrong := "fff"
+	if wrong == Fingerprint("Fix it.", "2.1.321") {
+		wrong = "ffe"
+	}
+	same := billingBody("x-anthropic-billing-header: cc_version=2.1.321."+wrong+"; cc_entrypoint=cli;", "Fix it.")
+	r, out := align(t, same, "2.1.321")
+	if r.Kind != CCFallback || r.Reason != ReasonFingerprintInvalid || r.From != "2.1.321" {
+		t.Fatalf("same version, wrong fingerprint: %+v", r)
+	}
+	if strings.Contains(out, BillingPrefix) || strings.Contains(out, "user_id") {
+		t.Fatalf("same version, wrong fingerprint: billing header or user_id left: %s", out)
+	}
+	if again, _ := align(t, out, "2.1.321"); again.Kind != CCNone {
+		t.Fatalf("same version, wrong fingerprint: second pass: %+v", again)
+	}
+	// At the target but the fingerprint text cannot be determined.
+	unknown := strings.Replace(valid, `"text":"Fix it."`, `"text":7`, 1)
+	if r, _ := align(t, unknown, "2.1.321"); r.Kind != CCFallback || r.Reason != ReasonFingerprintUnknown {
+		t.Fatalf("same version, unknown text: %+v", r)
 	}
 	// Empty target disables everything, including the fallback.
 	if r, _ := align(t, body, ""); r.Kind != CCNone {
